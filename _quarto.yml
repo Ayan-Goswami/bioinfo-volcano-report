@@ -1,0 +1,13 @@
+project:
+  type: website
+  output-dir: docs
+
+website:
+  title: "Transcriptomic Biomarker Pipeline"
+  navbar: false
+
+format:
+  html:
+    theme: cosmo
+    toc: true
+    code-fold: show
