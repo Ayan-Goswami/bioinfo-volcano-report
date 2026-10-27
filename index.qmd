@@ -1,0 +1,177 @@
+---
+title: "Gene Expression & Biomarker Discovery"
+subtitle: "Differential Expression Analysis Pipeline"
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    code-tools: true
+    self-contained: true
+execute:
+  warning: false
+  message: false
+---
+
+## Environment Verification
+
+```{r setup}
+library(reticulate)
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(DT)
+library(plotly)
+library(pheatmap)
+library(tibble)
+```
+
+## Data Acquisition & Differential Expression
+
+```{python load-real-dataset}
+import pandas as pd
+import numpy as np
+from scipy import stats
+import warnings
+
+# Suppress scipy precision warnings for zero-variance genes
+warnings.filterwarnings('ignore')
+
+# 1. Load your local dataset
+df = pd.read_csv("cleaned_expression.csv", index_col=0)
+
+# 2. Transpose it (genes become rows, samples become columns) 
+raw_counts = df.T.reset_index().rename(columns={'index': 'gene_id'})
+
+# 3. Grab the first 6 sample names for a 3 vs 3 comparison
+sample_names = raw_counts.columns[1:7].tolist()
+ctrl_cols = sample_names[0:3]
+trt_cols = sample_names[3:6]
+
+# Isolate the gene_id and these 6 samples
+expression_matrix = raw_counts[['gene_id'] + ctrl_cols + trt_cols].copy()
+
+# Rename columns to perfectly match our downstream R code
+expression_matrix.columns = [
+    "gene_id", 
+    "Control_Rep1", "Control_Rep2", "Control_Rep3", 
+    "Treated_Rep1", "Treated_Rep2", "Treated_Rep3"
+]
+
+numeric_cols = ["Control_Rep1", "Control_Rep2", "Control_Rep3", "Treated_Rep1", "Treated_Rep2", "Treated_Rep3"]
+
+# Drop genes that have zero variance across all 6 samples to prevent T-test failure
+for col in numeric_cols:
+    expression_matrix[col] = pd.to_numeric(expression_matrix[col], errors='coerce')
+    
+expression_matrix = expression_matrix.dropna()
+expression_matrix = expression_matrix[expression_matrix[numeric_cols].var(axis=1) > 0].copy()
+
+# 4. Apply log2 transformation to normalize the real RNA-seq counts
+for col in numeric_cols:
+    expression_matrix[col] = np.log2(expression_matrix[col] + 1)
+
+# 5. Compute Means and Log2 Fold Change
+expression_matrix['Control_Mean'] = expression_matrix[["Control_Rep1", "Control_Rep2", "Control_Rep3"]].mean(axis=1)
+expression_matrix['Treated_Mean'] = expression_matrix[["Treated_Rep1", "Treated_Rep2", "Treated_Rep3"]].mean(axis=1)
+expression_matrix['Log2FC'] = expression_matrix['Treated_Mean'] - expression_matrix['Control_Mean']
+
+# 6. Perform the T-test
+ctrl_matrix = expression_matrix[["Control_Rep1", "Control_Rep2", "Control_Rep3"]].values
+trt_matrix = expression_matrix[["Treated_Rep1", "Treated_Rep2", "Treated_Rep3"]].values
+t_stat, p_val = stats.ttest_ind(trt_matrix, ctrl_matrix, axis=1, equal_var=False)
+
+expression_matrix['p_value'] = p_val
+expression_matrix = expression_matrix.dropna(subset=['p_value']).copy()
+
+# Calculate -log10 p-value for the Y-axis of the Volcano plot
+expression_matrix['neg_log10_p'] = -np.log10(np.where(expression_matrix['p_value'] == 0, 1e-20, expression_matrix['p_value']))
+
+print(f"Success! Loaded {expression_matrix.shape[0]} real genes from cleaned_expression.csv.")
+```
+
+## Results Dashboard {.tabset}
+
+### Interactive Volcano Plot
+```{r interactive-volcano}
+# Pull the data frame from Python into R
+deg_data <- py$expression_matrix
+
+# Categorize genes based on thresholds
+deg_data <- deg_data %>%
+  mutate(
+    Significance = case_when(
+      Log2FC >= 1 & p_value < 0.05 ~ "Upregulated",
+      Log2FC <= -1 & p_value < 0.05 ~ "Downregulated",
+      TRUE ~ "Not Significant"
+    )
+  )
+
+# Create the base ggplot
+base_volcano <- ggplot(deg_data, aes(x = Log2FC, y = neg_log10_p, color = Significance, text = gene_id)) +
+  geom_point(alpha = 0.7, size = 2) +
+  scale_color_manual(values = c(
+    "Upregulated" = "#e74c3c",       
+    "Downregulated" = "#3498db",     
+    "Not Significant" = "#bdc3c7"    
+  )) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black", alpha = 0.5) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black", alpha = 0.5) +
+  theme_minimal() +
+  labs(x = "Log2 Fold Change", y = "-Log10(p-value)")
+
+# Render the interactive widget
+ggplotly(base_volcano, tooltip = c("text", "x", "y"))
+```
+
+### Significant Genes Table
+```{r data-table}
+# Format the data for the table
+significant_genes <- deg_data %>%
+  filter(Significance != "Not Significant") %>%
+  arrange(p_value) %>%
+  select(gene_id, Control_Mean, Treated_Mean, Log2FC, p_value, Significance) %>%
+  mutate(
+    Log2FC = round(Log2FC, 2),
+    p_value = signif(p_value, 3),
+    Control_Mean = round(Control_Mean, 2),
+    Treated_Mean = round(Treated_Mean, 2)
+  )
+
+# Display the interactive table
+datatable(significant_genes, 
+          options = list(pageLength = 10, scrollX = TRUE),
+          caption = "Differentially Expressed Genes Overview",
+          rownames = FALSE)
+```
+
+### Expression Heatmap
+```{r plot-heatmap}
+# Extract the top 30 most significant genes
+top_30_genes <- deg_data %>%
+  filter(Significance != "Not Significant") %>%
+  arrange(p_value) %>%
+  head(30) %>%
+  pull(gene_id)
+
+# Filter for those genes, strip existing row names, and set gene_id as row names
+heatmap_data <- deg_data %>%
+  filter(gene_id %in% top_30_genes) %>%
+  select(gene_id, Control_Rep1, Control_Rep2, Control_Rep3, Treated_Rep1, Treated_Rep2, Treated_Rep3) %>%
+  remove_rownames() %>%
+  column_to_rownames("gene_id")
+
+# Create an annotation dataframe for the column colors (Treated vs Control)
+annotation_col <- data.frame(
+  Condition = c(rep("Control", 3), rep("Treated", 3))
+)
+rownames(annotation_col) <- colnames(heatmap_data)
+
+# Generate the heatmap
+pheatmap(as.matrix(heatmap_data),
+         scale = "row",
+         annotation_col = annotation_col,
+         color = colorRampPalette(c("#3498db", "white", "#e74c3c"))(50),
+         main = "Top 30 Differentially Expressed Genes")
+```
